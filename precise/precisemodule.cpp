@@ -48,6 +48,8 @@
 #include "model_manager_impl.h"
 
 // Includes from precise:
+#include "glif_cond_ps.h"
+#include "glif_psc_ps.h"
 #include "iaf_psc_alpha_canon.h"
 #include "iaf_psc_alpha_presc.h"
 #include "iaf_psc_alpha_ps.h"
@@ -91,6 +93,8 @@ void
 PreciseModule::init( SLIInterpreter* )
 {
   // register models
+  kernel().model_manager.register_node_model< glif_cond_ps >( "glif_cond_ps" );
+  kernel().model_manager.register_node_model< glif_psc_ps >( "glif_psc_ps" );
   kernel().model_manager.register_node_model< iaf_psc_alpha_canon >( "iaf_psc_alpha_canon" );
   kernel().model_manager.register_node_model< iaf_psc_alpha_presc >( "iaf_psc_alpha_presc" );
   kernel().model_manager.register_node_model< iaf_psc_alpha_ps >( "iaf_psc_alpha_ps" );

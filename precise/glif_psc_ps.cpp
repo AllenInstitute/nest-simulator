@@ -103,6 +103,9 @@ nest::glif_psc_ps::State_::State_( const Parameters_& p )
   , ASCurrents_( p.asc_init_ ) // in pA
   , ASCurrents_sum_( 0.0 )     // in pA
   , refractory_steps_( 0 )
+  , is_refractory_( false )
+  , last_spike_step_( -1 )
+  , last_spike_offset_( 0.0 )
 {
   for ( std::size_t a = 0; a < p.asc_init_.size(); ++a )
   {
@@ -393,9 +396,12 @@ nest::glif_psc_ps::init_state_( const Node& proto )
 void
 nest::glif_psc_ps::init_buffers_()
 {
-  B_.spikes_.clear();   // includes resize
+  B_.events_.resize();
+  B_.events_.clear();
   B_.currents_.clear(); // include resize
   B_.logger_.reset();   // includes resize
+
+  Archiving_Node::clear_history();
 }
 
 void
@@ -404,6 +410,7 @@ nest::glif_psc_ps::calibrate()
   B_.logger_.init();
 
   const double h = Time::get_resolution().get_ms(); // in ms
+  V_.h_ms_ = h;
 
   // pre-computing of decay parameters
   if ( P_.has_theta_spike_ )
@@ -463,7 +470,7 @@ nest::glif_psc_ps::calibrate()
     V_.P32_[ i ] = propagator_32( P_.tau_syn_[ i ], Tau_, P_.C_m_, h );
 
     V_.PSCInitialValues_[ i ] = 1.0 * numerics::e / P_.tau_syn_[ i ];
-    B_.spikes_[ i ].resize();
+    //B_.spikes_[ i ].resize();
   }
 
   V_.RefractoryCounts_ = Time( Time::ms( P_.t_ref_ ) ).get_steps();
@@ -473,135 +480,242 @@ nest::glif_psc_ps::calibrate()
  * Update and spike handling functions
  * ---------------------------------------------------------------- */
 
+bool
+nest::glif_psc_ps::get_next_event_( const long T, double& ev_offset, double& ev_weight, bool& end_of_refract )
+{
+  return B_.events_.get_next_spike( T, false, ev_offset, ev_weight, end_of_refract );
+}
+
 void
 nest::glif_psc_ps::update( Time const& origin, const long from, const long to )
 {
 
   double v_old = S_.U_;
 
+  assert( to >= 0 );
+  assert( static_cast< delay >( from ) < kernel().connection_manager.get_min_delay() );
+  assert( from < to );
+
+  // at start of slice, tell input queue to prepare for delivery
+  if ( from == 0 )
+  {
+    B_.events_.prepare_delivery();
+  }
+
+  /* Neurons may have been initialized to superthreshold potentials.
+     We need to check for this here and issue spikes at the beginning of
+     the interval.
+  */
+  if ( S_.U_ >= S_.threshold_ )
+  {
+    emit_instant_spike_( origin, from, V_.h_ms_ * ( 1 - std::numeric_limits< double >::epsilon() ) );
+  }
+
   for ( long lag = from; lag < to; ++lag )
   {
+    // time at start of update step
+	const long T = origin.get_steps() + lag;
+	// if neuron returns from refractoriness during this step, place
+	// pseudo-event in queue to mark end of refractory period
+	if ( S_.is_refractory_ && ( T + 1 - S_.last_spike_step_ == V_.refractory_steps_ ) )
+	{
+	  B_.events_.add_refractory( T, S_.last_spike_offset_ );
+	}
 
-    if ( S_.refractory_steps_ == 0 )
-    {
-      // neuron not refractory, integrate voltage and currents
+	// save state at beginning of interval for spike-time interpolation
+	V_.I_before_ = S_.I_;
+	V_.I_syn_before_ = S_.I_syn_;
+	V_.U_before_ = S_.U_;
 
-      // update threshold via exact solution of dynamics of spike component of
-      // threshold for glif2/4/5 models with "R"
-      if ( P_.has_theta_spike_ )
+	// get first event
+	double ev_offset;
+	double ev_weight;
+	bool end_of_refract;
+
+	if ( not get_next_event_( T, ev_offset, ev_weight, end_of_refract ) )
+	{
+	  // No incoming spikes, handle with fixed propagator matrix.
+	  // Handling this case separately improves performance significantly
+	  // if there are many steps without input spikes.
+
+	  // update membrane potential
+      //if ( S_.refractory_steps_ == 0 )
+	  if ( not S_.is_refractory_ )
       {
-        S_.threshold_spike_ = S_.threshold_spike_ * V_.theta_spike_decay_rate_;
-      }
+        // neuron not refractory, integrate voltage and currents
 
-      // Calculate new ASCurrents value using exponential methods
-      S_.ASCurrents_sum_ = 0.0;
-      // for glif3/4/5 models with "ASC"
-      // take after spike current value at the beginning of the time to compute
-      // the exact mean ASC for the time step and sum the exact ASCs of all ports;
-      // and then update the current values to the value at the end of the time
-      // step, ready for the next time step
-      if ( P_.has_asc_ )
-      {
-        for ( std::size_t a = 0; a < S_.ASCurrents_.size(); ++a )
+        // update threshold via exact solution of dynamics of spike component of
+        // threshold for glif2/4/5 models with "R"
+        if ( P_.has_theta_spike_ )
         {
-          S_.ASCurrents_sum_ += ( V_.asc_stable_coeff_[ a ] * S_.ASCurrents_[ a ] );
-          S_.ASCurrents_[ a ] = S_.ASCurrents_[ a ] * V_.asc_decay_rates_[ a ];
+          S_.threshold_spike_ = S_.threshold_spike_ * V_.theta_spike_decay_rate_;
         }
-      }
 
-      // voltage dynamics of membranes, linear exact to find next V_m value
-      S_.U_ = v_old * V_.P33_ + ( S_.I_ + S_.ASCurrents_sum_ ) * V_.P30_;
-
-      // add synapse component for voltage dynamics
-      S_.I_syn_ = 0.0;
-      for ( size_t i = 0; i < P_.n_receptors_(); i++ )
-      {
-        S_.U_ += V_.P31_[ i ] * S_.y1_[ i ] + V_.P32_[ i ] * S_.y2_[ i ];
-        S_.I_syn_ += S_.y2_[ i ];
-      }
-
-      // Calculate exact voltage component of the threshold for glif5 model with
-      // "A"
-      if ( P_.has_theta_voltage_ )
-      {
-        const double beta = ( S_.I_ + S_.ASCurrents_sum_ ) / P_.G_;
-        S_.threshold_voltage_ = V_.phi * ( v_old - beta ) * V_.potential_decay_rate_
-          + V_.theta_voltage_decay_rate_inverse_
-            * ( S_.threshold_voltage_ - V_.phi * ( v_old - beta ) - V_.abpara_ratio_voltage_ * beta )
-          + V_.abpara_ratio_voltage_ * beta;
-      }
-
-      S_.threshold_ = S_.threshold_spike_ + S_.threshold_voltage_ + P_.th_inf_;
-
-      // Check if there is an action potential
-      if ( S_.U_ > S_.threshold_ )
-      {
-        // Marks that the neuron is in a refractory period
-        S_.refractory_steps_ = V_.RefractoryCounts_;
-
-        // Reset ASC_currents for glif3/4/5 models with "ASC"
+        // Calculate new ASCurrents value using exponential methods
+        S_.ASCurrents_sum_ = 0.0;
+        // for glif3/4/5 models with "ASC"
+        // take after spike current value at the beginning of the time to compute
+        // the exact mean ASC for the time step and sum the exact ASCs of all ports;
+        // and then update the current values to the value at the end of the time
+        // step, ready for the next time step
         if ( P_.has_asc_ )
         {
           for ( std::size_t a = 0; a < S_.ASCurrents_.size(); ++a )
           {
-            S_.ASCurrents_[ a ] = P_.asc_amps_[ a ] + S_.ASCurrents_[ a ] * V_.asc_refractory_decay_rates_[ a ];
+            S_.ASCurrents_sum_ += ( V_.asc_stable_coeff_[ a ] * S_.ASCurrents_[ a ] );
+            S_.ASCurrents_[ a ] = S_.ASCurrents_[ a ] * V_.asc_decay_rates_[ a ];
           }
         }
 
-        // Reset voltage
-        if ( not P_.has_theta_spike_ )
-        {
-          // Reset voltage for glif1/3 models without "R"
-          S_.U_ = P_.V_reset_;
-        }
-        else
-        {
-          // Reset voltage for glif2/4/5 models with "R"
-          S_.U_ = P_.voltage_reset_fraction_ * v_old + P_.voltage_reset_add_;
+        // voltage dynamics of membranes, linear exact to find next V_m value
+        S_.U_ = v_old * V_.P33_ + ( S_.I_ + S_.ASCurrents_sum_ ) * V_.P30_;
 
-          // reset spike component of threshold
-          // (decay for refractory period and then add additive constant)
-          S_.threshold_spike_ = S_.threshold_spike_ * V_.theta_spike_refractory_decay_rate_ + P_.th_spike_add_;
-
-          // rest the global threshold (voltage component of threshold: stay the
-          // same)
-          S_.threshold_ = S_.threshold_spike_ + S_.threshold_voltage_ + P_.th_inf_;
+        // add synapse component for voltage dynamics
+        S_.I_syn_ = 0.0;
+        for ( size_t i = 0; i < P_.n_receptors_(); i++ )
+        {
+          S_.U_ += V_.P31_[ i ] * S_.y1_[ i ] + V_.P32_[ i ] * S_.y2_[ i ];
+          S_.I_syn_ += S_.y2_[ i ];
         }
 
-        set_spiketime( Time::step( origin.get_steps() + lag + 1 ) );
-        SpikeEvent se;
-        kernel().event_delivery_manager.send( *this, se, lag );
+        // Calculate exact voltage component of the threshold for glif5 model with
+        // "A"
+        if ( P_.has_theta_voltage_ )
+        {
+          const double beta = ( S_.I_ + S_.ASCurrents_sum_ ) / P_.G_;
+          S_.threshold_voltage_ = V_.phi * ( v_old - beta ) * V_.potential_decay_rate_
+            + V_.theta_voltage_decay_rate_inverse_
+            * ( S_.threshold_voltage_ - V_.phi * ( v_old - beta ) - V_.abpara_ratio_voltage_ * beta )
+            + V_.abpara_ratio_voltage_ * beta;
+        }
+
+        S_.threshold_ = S_.threshold_spike_ + S_.threshold_voltage_ + P_.th_inf_;
+
+        // alpha shape PSCs
+        for ( size_t i = 0; i < P_.n_receptors_(); i++ )
+        {
+          S_.y2_[ i ] = V_.P21_[ i ] * S_.y1_[ i ] + V_.P22_[ i ] * S_.y2_[ i ];
+          S_.y1_[ i ] *= V_.P11_[ i ];
+
+          // Apply spikes delivered in this step: The spikes arriving at T+1 have an
+          // immediate effect on the state of the neuron
+          //S_.y1_[ i ] += V_.PSCInitialValues_[ i ] * B_.spikes_[ i ].get_value( lag );
+        }
+
+        /* The following must not be moved before the y1_, dI_ex_ update,
+           since the spike-time interpolation within emit_spike_ depends
+           on all state variables having their values at the end of the
+           interval.
+        */
+        // Check if there is an action potential
+        if ( S_.U_ > S_.threshold_ )
+        {
+          emit_spike_( origin, lag, 0, V_.h_ms_ );
+        }
       }
     }
     else
     {
       // neuron is absolute refractory
-      --S_.refractory_steps_;
+      //--S_.refractory_steps_;
 
       // While neuron is in refractory period count-down in time steps (since dt
       // may change while in refractory) while holding the voltage at last peak.
-      S_.U_ = v_old;
-      S_.threshold_ = S_.threshold_spike_ + S_.threshold_voltage_ + P_.th_inf_;
-    }
+      //S_.U_ = v_old;
+      //S_.threshold_ = S_.threshold_spike_ + S_.threshold_voltage_ + P_.th_inf_;
 
+      // We get here if there is at least one event,
+      // which has been read above.  We can therefore use a do-while loop.
+
+      // Time within step is measured by offsets, which are h at the beginning
+      // and 0 at the end of the step.
+      double last_offset = V_.h_ms_; // start of step
+
+      do
+      {
+        // time is measured backward: inverse order in difference
+        const double ministep = last_offset - ev_offset;
+
+        propagate_( ministep );
+
+        // check for threshold crossing during ministep
+        // this must be done before adding the input, since
+        // interpolation requires continuity
+        if ( S_.V_m_ >= S_.threshold_ )
+        {
+          emit_spike_( origin, lag, V_.h_ms_ - last_offset, ministep );
+        }
+
+
+        // handle event
+        if ( end_of_refract )
+        {
+          S_.is_refractory_ = false;
+        } // return from refractoriness
+        else
+        {
+          if ( ev_weight >= 0.0 )
+          {
+            S_.dI_ex_ += V_.psc_norm_ex_ * ev_weight; // exc. spike input
+          }
+          else
+          {
+            S_.dI_in_ += V_.psc_norm_in_ * ev_weight;
+          } // inh. spike input
+
+          // alpha shape PSCs
+          for ( size_t i = 0; i < P_.n_receptors_(); i++ )
+          {
+            S_.y2_[ i ] = V_.P21_[ i ] * S_.y1_[ i ] + V_.P22_[ i ] * S_.y2_[ i ];
+            S_.y1_[ i ] *= V_.P11_[ i ];
+
+            // Apply spikes delivered in this step: The spikes arriving at T+1 have an
+            // immediate effect on the state of the neuron
+            S_.y1_[ i ] += V_.PSCInitialValues_[ i ] * B_.spikes_[ i ].get_value( lag );
+          }
+        }
+
+        // store state
+        V_.I_ex_before_ = S_.I_ex_;
+        V_.I_in_before_ = S_.I_in_;
+        V_.V_m_before_ = S_.V_m_;
+        last_offset = ev_offset;
+
+      } while ( get_next_event_( T, ev_offset, ev_weight, end_of_refract ) );
+
+      // no events remaining, plain update step across remainder
+      // of interval
+      if ( last_offset > 0 ) // not at end of step, do remainder
+      {
+        propagate_( last_offset );
+        if ( S_.V_m_ >= S_.threshold_ )
+        {
+          emit_spike_( origin, lag, V_.h_ms_ - last_offset, last_offset );
+        }
+      }
+    } // else
+
+	// non-precise
     // alpha shape PSCs
-    for ( size_t i = 0; i < P_.n_receptors_(); i++ )
-    {
-      S_.y2_[ i ] = V_.P21_[ i ] * S_.y1_[ i ] + V_.P22_[ i ] * S_.y2_[ i ];
-      S_.y1_[ i ] *= V_.P11_[ i ];
+    //for ( size_t i = 0; i < P_.n_receptors_(); i++ )
+    //{
+    //  S_.y2_[ i ] = V_.P21_[ i ] * S_.y1_[ i ] + V_.P22_[ i ] * S_.y2_[ i ];
+    //  S_.y1_[ i ] *= V_.P11_[ i ];
 
       // Apply spikes delivered in this step: The spikes arriving at T+1 have an
       // immediate effect on the state of the neuron
-      S_.y1_[ i ] += V_.PSCInitialValues_[ i ] * B_.spikes_[ i ].get_value( lag );
-    }
+      //S_.y1_[ i ] += V_.PSCInitialValues_[ i ] * B_.spikes_[ i ].get_value( lag );
+    //}
 
-    // Update any external currents
+    // Set new input current. The current change occurs at the
+    // end of the interval and thus must come AFTER the threshold-
+    // crossing interpolation
     S_.I_ = B_.currents_.get_value( lag );
 
     // Save voltage
     B_.logger_.record_data( origin.get_steps() + lag );
     v_old = S_.U_;
-  }
+  } // from lag = from ...
 }
 
 nest::port
@@ -641,3 +755,158 @@ nest::glif_psc_ps::handle( DataLoggingRequest& e )
 {
   B_.logger_.handle( e ); // the logger does this for us
 }
+
+// auxiliary functions ---------------------------------------------
+
+void
+nest::glif_psc_ps::propagate_( const double dt )
+{
+  // needed in any case
+  const double ps_e_TauSyn_ex = numerics::expm1( -dt / P_.tau_syn_ex_ );
+  const double ps_e_TauSyn_in = numerics::expm1( -dt / P_.tau_syn_in_ );
+
+  // V_m_ remains unchanged at 0.0 while neuron is refractory
+  if ( not S_.is_refractory_ )
+  {
+    const double ps_e_Tau = numerics::expm1( -dt / P_.tau_m_ );
+    const double ps_P30 = -P_.tau_m_ / P_.c_m_ * ps_e_Tau;
+
+    const double ps_P31_ex = V_.gamma_sq_ex_ * ps_e_Tau - V_.gamma_sq_ex_ * ps_e_TauSyn_ex
+      - dt * V_.gamma_ex_ * ps_e_TauSyn_ex - dt * V_.gamma_ex_;
+    const double ps_P32_ex = V_.gamma_ex_ * ps_e_Tau - V_.gamma_ex_ * ps_e_TauSyn_ex;
+
+    const double ps_P31_in = V_.gamma_sq_in_ * ps_e_Tau - V_.gamma_sq_in_ * ps_e_TauSyn_in
+      - dt * V_.gamma_in_ * ps_e_TauSyn_in - dt * V_.gamma_in_;
+    const double ps_P32_in = V_.gamma_in_ * ps_e_Tau - V_.gamma_in_ * ps_e_TauSyn_in;
+
+    S_.V_m_ = ps_P30 * ( P_.I_e_ + S_.y_input_ ) + ps_P31_ex * S_.dI_ex_ + ps_P32_ex * S_.I_ex_ + ps_P31_in * S_.dI_in_
+      + ps_P32_in * S_.I_in_ + ps_e_Tau * S_.V_m_ + S_.V_m_;
+
+    // lower bound of membrane potential
+    S_.V_m_ = ( S_.V_m_ < P_.U_min_ ? P_.U_min_ : S_.V_m_ );
+  }
+
+  // now the synaptic components
+  S_.I_ex_ = ( ps_e_TauSyn_ex + 1. ) * dt * S_.dI_ex_ + ( ps_e_TauSyn_ex + 1. ) * S_.I_ex_;
+  S_.dI_ex_ = ( ps_e_TauSyn_ex + 1. ) * S_.dI_ex_;
+
+  S_.I_in_ = ( ps_e_TauSyn_in + 1. ) * dt * S_.dI_in_ + ( ps_e_TauSyn_in + 1. ) * S_.I_in_;
+  S_.dI_in_ = ( ps_e_TauSyn_in + 1. ) * S_.dI_in_;
+}
+
+void
+nest::glif_psc_ps::emit_spike_( Time const& origin, const long lag, const double t0, const double dt )
+{
+
+  // Marks that the neuron is in a refractory period
+  S_.refractory_steps_ = V_.RefractoryCounts_;
+
+  // Reset ASC_currents for glif3/4/5 models with "ASC"
+  if ( P_.has_asc_ )
+  {
+    for ( std::size_t a = 0; a < S_.ASCurrents_.size(); ++a )
+    {
+      S_.ASCurrents_[ a ] = P_.asc_amps_[ a ] + S_.ASCurrents_[ a ] * V_.asc_refractory_decay_rates_[ a ];
+    }
+  }
+
+  // Reset voltage
+  if ( not P_.has_theta_spike_ )
+  {
+    // Reset voltage for glif1/3 models without "R"
+    S_.U_ = P_.V_reset_;
+  }
+  else
+  {
+    // Reset voltage for glif2/4/5 models with "R"
+    S_.U_ = P_.voltage_reset_fraction_ * v_old + P_.voltage_reset_add_;
+
+    // reset spike component of threshold
+    // (decay for refractory period and then add additive constant)
+    S_.threshold_spike_ = S_.threshold_spike_ * V_.theta_spike_refractory_decay_rate_ + P_.th_spike_add_;
+
+    // rest the global threshold (voltage component of threshold: stay the
+    // same)
+    S_.threshold_ = S_.threshold_spike_ + S_.threshold_voltage_ + P_.th_inf_;
+  }
+
+  set_spiketime( Time::step( origin.get_steps() + lag + 1 ) );
+  SpikeEvent se;
+  kernel().event_delivery_manager.send( *this, se, lag );
+
+  // we know that the potential is subthreshold at t0, super at t0+dt
+
+  // compute spike time relative to beginning of step
+  S_.last_spike_step_ = origin.get_steps() + lag + 1;
+  S_.last_spike_offset_ = V_.h_ms_ - ( t0 + bisectioning_( dt ) );
+
+  // reset neuron and make it refractory
+  S_.V_m_ = P_.U_reset_;
+  S_.is_refractory_ = true;
+
+  // send spike
+  set_spiketime( Time::step( S_.last_spike_step_ ), S_.last_spike_offset_ );
+  SpikeEvent se;
+  se.set_offset( S_.last_spike_offset_ );
+  kernel().event_delivery_manager.send( *this, se, lag );
+
+  return;
+}
+
+void
+nest::glif_psc_ps::emit_instant_spike_( Time const& origin, const long lag, const double spike_offs )
+{
+  assert( S_.V_m_ >= P_.U_th_ ); // ensure we are superthreshold
+
+  // set stamp and offset for spike
+  S_.last_spike_step_ = origin.get_steps() + lag + 1;
+  S_.last_spike_offset_ = spike_offs;
+
+  // reset neuron and make it refractory
+  S_.V_m_ = P_.U_reset_;
+  S_.is_refractory_ = true;
+
+  // send spike
+  set_spiketime( Time::step( S_.last_spike_step_ ), S_.last_spike_offset_ );
+  SpikeEvent se;
+  se.set_offset( S_.last_spike_offset_ );
+  kernel().event_delivery_manager.send( *this, se, lag );
+
+  return;
+}
+
+double
+nest::glif_psc_ps::bisectioning_( const double dt ) const
+{
+  double root = 0.0;
+
+  double V_m_root = V_.V_m_before_;
+
+  double div = 2.0;
+
+  while ( fabs( P_.U_th_ - V_m_root ) > 1e-14 )
+  {
+    if ( V_m_root > P_.U_th_ )
+    {
+      root -= dt / div;
+    }
+    else
+    {
+      root += dt / div;
+    }
+
+    div *= 2.0;
+
+    const double expm1_tau_m = numerics::expm1( -root / P_.tau_m_ );
+
+    const double P20 = -P_.tau_m_ / P_.c_m_ * expm1_tau_m;
+
+    const double P21_ex = propagator_32( P_.tau_syn_ex_, P_.tau_m_, P_.c_m_, root );
+    const double P21_in = propagator_32( P_.tau_syn_in_, P_.tau_m_, P_.c_m_, root );
+
+    V_m_root = P20 * ( P_.I_e_ + V_.y_input_before_ ) + P21_ex * V_.I_ex_before_ + P21_in * V_.I_in_before_
+      + expm1_tau_m * V_.V_m_before_ + V_.V_m_before_;
+  }
+  return root;
+}
+

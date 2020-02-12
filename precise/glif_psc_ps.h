@@ -20,8 +20,8 @@
  *
  */
 
-#ifndef GLIF_PSC_H
-#define GLIF_PSC_H
+#ifndef GLIF_PSC_PS_H
+#define GLIF_PSC_PS_H
 
 #include "archiving_node.h"
 #include "connection.h"
@@ -31,6 +31,9 @@
 #include "universal_data_logger.h"
 
 #include "dictdatum.h"
+
+// Includes from precise:
+#include "slice_ring_buffer.h"
 
 /* BeginDocumentation
 Name: glif_psc_ps - Current-based generalized leaky integrate and fire (GLIF)
@@ -161,6 +164,12 @@ public:
   nest::port handles_test_event( nest::CurrentEvent&, nest::port );
   nest::port handles_test_event( nest::DataLoggingRequest&, nest::port );
 
+  bool
+  is_off_grid() const
+  {
+    return true;
+  } // uses off_grid events
+
   void get_status( DictionaryDatum& ) const;
   void set_status( const DictionaryDatum& );
 
@@ -174,8 +183,84 @@ private:
   //! Initialize auxiliary quantities, leave parameters and state untouched.
   void calibrate();
 
-  //! Take neuron through given time interval
+  //!
+  bool get_next_event_( const long T, double& ev_offset, double& ev_weight, bool& end_of_refract );
+
+  /**
+   * Time Evolution Operator.
+   *
+   * update() promotes the state of the neuron from origin+from to origin+to.
+   * It does so in steps of the resolution h.  Within each step, time is
+   * advanced from event to event, as retrieved from the spike queue.
+   *
+   * Return from refractoriness is handled as a special event in the
+   * queue, which is marked by a weight that is GSL_NAN.  This greatly
+   * simplifies the code.
+   *
+   * For steps, during which no events occur, the precomputed propagator matrix
+   * is used.  For other steps, the propagator matrix is computed as needed.
+   *
+   * While the neuron is refractory, membrane potential (y3_) is
+   * clamped to U_reset_.
+   */
   void update( nest::Time const&, const long, const long );
+
+  /**
+   * Propagate neuron state.
+   * Propagate the neuron's state by dt.
+   * @param dt Interval over which to propagate
+   */
+  void propagate_( const double dt );
+
+  /**
+   * Trigger interpolation method to find the precise spike time
+   * within the mini-timestep (t0,t0+dt] assuming that the membrane
+   * potential was below threshold at t0 and above at t0+dt. Emit
+   * the spike and reset the neuron.
+   *
+   * @param origin  Time stamp at beginning of slice
+   * @param lag     Time step within slice
+   * @param t0      Beginning of mini-timestep
+   * @param dt      Duration of mini-timestep
+   */
+  void emit_spike_( Time const& origin, const long lag, const double t0, const double dt );
+
+  /**
+   * Instantaneously emit a spike at the precise time defined by
+   * origin, lag and spike_offset and reset the neuron.
+   *
+   * @param origin        Time stamp at beginning of slice
+   * @param lag           Time step within slice
+   * @param spike_offset  Time offset for spike
+   */
+  void emit_instant_spike_( Time const& origin, const long lag, const double spike_offset );
+
+  /** @name Threshold-crossing interpolation
+   * These functions determine the time of threshold crossing using
+   * interpolation, one function per interpolation
+   * order. thresh_find() is the driver function and the only one to
+   * be called directly.
+   */
+  //@{
+
+  /** Interpolation orders. */
+  enum interpOrder
+  {
+    NO_INTERPOL,
+    LINEAR,
+    QUADRATIC,
+    CUBIC,
+    END_INTERP_ORDER
+  };
+
+  /**
+   * Localize threshold crossing by bisectioning.
+   * @param   double length of interval since previous event
+   * @returns time from previous event to threshold crossing
+   */
+  double bisectioning_( const double dt ) const;
+  //@}
+
 
   // The next two classes need to be friends to access the State_ class/member
   friend class nest::RecordablesMap< glif_psc_ps >;
@@ -236,7 +321,9 @@ private:
     int refractory_steps_;             //!< Number of refractory steps remaining
     std::vector< double > y1_;         //!< synapse current evolution state 1 in pA
     std::vector< double > y2_;         //!< synapse current evolution state 2 in pA
-
+    bool is_refractory_;               //!< true while refractory
+    long last_spike_step_;             //!< time stamp of most recent spike
+    double last_spike_offset_;         //!< offset of most recent spike
     State_( const Parameters_& );
 
     void get( DictionaryDatum&, const Parameters_& ) const;
@@ -249,7 +336,11 @@ private:
     Buffers_( glif_psc_ps& );
     Buffers_( const Buffers_&, glif_psc_ps& );
 
-    std::vector< nest::RingBuffer > spikes_; //!< Buffer incoming spikes through delay, as sum
+    /**
+     * Queue for incoming events.
+     * @note Handles also pseudo-events marking return from refractoriness.
+     */
+    SliceRingBuffer events_;
     nest::RingBuffer currents_;              //!< Buffer incoming currents through delay,
 
     //! Logger for all analog data
@@ -258,6 +349,7 @@ private:
 
   struct Variables_
   {
+	double h_ms_;                                      //!< time resolution in ms
     int RefractoryCounts_;                             //!< counter during refractory period
     double theta_spike_decay_rate_;                    //!< threshold spike component decay rate
     double theta_spike_refractory_decay_rate_;         //!< threshold spike component decay rate during refractory
@@ -282,6 +374,10 @@ private:
               weight one has an amplitude of 1 pA.
     */
     std::vector< double > PSCInitialValues_;
+
+    double I_before_;   //!< at beginning of mini-step, for interpolation
+    double I_syn_before_;      //!< at beginning of mini-step, for interpolation
+    double U_before_;       //!< at beginning of mini-step, for interpolation
   };
 
   double
